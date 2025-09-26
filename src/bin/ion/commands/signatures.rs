@@ -1,0 +1,243 @@
+use crate::commands::{CommandIo, IonCliCommand, WithIonCliArgument};
+use anyhow::Result;
+use clap::{ArgMatches, Command};
+use ion_rs::*;
+use std::collections::HashMap;
+
+pub struct SignaturesCommand;
+
+impl IonCliCommand for SignaturesCommand {
+    fn name(&self) -> &'static str {
+        "signatures"
+    }
+
+    fn about(&self) -> &'static str {
+        "Detect repeated signatures for Ion container types"
+    }
+
+    fn is_stable(&self) -> bool {
+        false
+    }
+
+    fn configure_args(&self, command: Command) -> Command {
+        command
+            .long_about("Analyzes Ion input to detect repeated signatures for container types (struct, list, sexp).\n\
+                Two objects have the same signature if:\n\
+                - Both structs have the same fields with the same types\n\
+                - Both lists/sexps have the same number of elements with the same types in order")
+            .with_input()
+            .with_output()
+            .arg(clap::Arg::new("min-signature-size")
+                .long("min-signature-size")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("2")
+                .help("Minimum size for signatures to be registered (default: 2)"))
+    }
+
+    fn run(&self, _command_path: &mut Vec<String>, args: &ArgMatches) -> Result<()> {
+        let min_size = *args.get_one::<usize>("min-signature-size").unwrap();
+        let mut signature_registry = SignatureRegistry::new();
+        
+        CommandIo::new(args)?.for_each_input(|_output, input| {
+            let mut reader = SystemReader::new(AnyEncoding, input.into_source());
+            
+            loop {
+                match reader.next_item()? {
+                    SystemStreamItem::EndOfStream(_) => break,
+                    SystemStreamItem::Value(value) => {
+                        collect_signatures(value, &mut signature_registry, min_size)?;
+                    }
+                    _ => continue,
+                }
+            }
+            Ok(())
+        })?;
+
+        // Output results
+        let mut sorted_counts: Vec<_> = signature_registry.counts.iter().collect();
+        sorted_counts.sort_by(|a, b| b.1.cmp(a.1));
+        for (id, count) in sorted_counts {
+            let signature = &signature_registry.signatures[*id];
+            println!("{} values appear with signature #{} {}", count, id, signature.display(&signature_registry));
+        }
+
+        Ok(())
+    }
+}
+
+type SignatureId = usize;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum TypeSignature {
+    Null,
+    Bool,
+    Int,
+    Float,
+    Decimal,
+    Timestamp,
+    String,
+    Symbol,
+    Blob,
+    Clob,
+    Container(SignatureId),
+    Verbatim(ContainerSignature),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ContainerSignature {
+    Struct(Vec<(String, TypeSignature)>),
+    List(Vec<TypeSignature>),
+    SExp(Vec<TypeSignature>),
+}
+
+struct SignatureRegistry {
+    signatures: Vec<ContainerSignature>,
+    signature_to_id: HashMap<ContainerSignature, SignatureId>,
+    counts: HashMap<SignatureId, usize>,
+}
+
+impl SignatureRegistry {
+    fn new() -> Self {
+        Self {
+            signatures: Vec::new(),
+            signature_to_id: HashMap::new(),
+            counts: HashMap::new(),
+        }
+    }
+    
+    fn get_or_create_id(&mut self, signature: ContainerSignature) -> SignatureId {
+        if let Some(&id) = self.signature_to_id.get(&signature) {
+            *self.counts.entry(id).or_insert(0) += 1;
+            id
+        } else {
+            let id = self.signatures.len();
+            self.signatures.push(signature.clone());
+            self.signature_to_id.insert(signature, id);
+            *self.counts.entry(id).or_insert(0) += 1;
+            id
+        }
+    }
+}
+
+impl ContainerSignature {
+    fn size(&self, registry: &SignatureRegistry) -> usize {
+        match self {
+            ContainerSignature::Struct(fields) => {
+                fields.len() + fields.iter().map(|(_, typ)| typ.container_size(registry)).sum::<usize>()
+            }
+            ContainerSignature::List(elements) => {
+                elements.len() + elements.iter().map(|typ| typ.container_size(registry)).sum::<usize>()
+            }
+            ContainerSignature::SExp(elements) => {
+                elements.len() + elements.iter().map(|typ| typ.container_size(registry)).sum::<usize>()
+            }
+        }
+    }
+    
+    fn display(&self, registry: &SignatureRegistry) -> String {
+        match self {
+            ContainerSignature::Struct(fields) => {
+                let field_strs: Vec<String> = fields.iter().map(|(name, typ)| {
+                    format!("{}: {}", name, typ.display(registry))
+                }).collect();
+                format!("{{ {} }}", field_strs.join(", "))
+            }
+            ContainerSignature::List(elements) => {
+                let elem_strs: Vec<String> = elements.iter().map(|typ| typ.display(registry)).collect();
+                format!("[ {} ]", elem_strs.join(", "))
+            }
+            ContainerSignature::SExp(elements) => {
+                let elem_strs: Vec<String> = elements.iter().map(|typ| typ.display(registry)).collect();
+                format!("( {} )", elem_strs.join(" "))
+            }
+        }
+    }
+}
+
+impl TypeSignature {
+    fn container_size(&self, registry: &SignatureRegistry) -> usize {
+        match self {
+            TypeSignature::Container(id) => registry.signatures[*id].size(registry),
+            TypeSignature::Verbatim(sig) => sig.size(registry),
+            _ => 0,
+        }
+    }
+    
+    fn display(&self, registry: &SignatureRegistry) -> String {
+        match self {
+            TypeSignature::Null => "null".to_string(),
+            TypeSignature::Bool => "bool".to_string(),
+            TypeSignature::Int => "int".to_string(),
+            TypeSignature::Float => "float".to_string(),
+            TypeSignature::Decimal => "decimal".to_string(),
+            TypeSignature::Timestamp => "timestamp".to_string(),
+            TypeSignature::String => "string".to_string(),
+            TypeSignature::Symbol => "symbol".to_string(),
+            TypeSignature::Blob => "blob".to_string(),
+            TypeSignature::Clob => "clob".to_string(),
+            TypeSignature::Container(id) => format!("(#{})", *id),
+            TypeSignature::Verbatim(sig) => sig.display(registry),
+        }
+    }
+}
+
+fn collect_signatures(value: LazyValue<AnyEncoding>, registry: &mut SignatureRegistry, min_size: usize) -> Result<TypeSignature> {
+    use ValueRef::*;
+    Ok(match value.read()? {
+        Null(_) => TypeSignature::Null,
+        Bool(_) => TypeSignature::Bool,
+        Int(_) => TypeSignature::Int,
+        Float(_) => TypeSignature::Float,
+        Decimal(_) => TypeSignature::Decimal,
+        Timestamp(_) => TypeSignature::Timestamp,
+        String(_) => TypeSignature::String,
+        Symbol(_) => TypeSignature::Symbol,
+        Blob(_) => TypeSignature::Blob,
+        Clob(_) => TypeSignature::Clob,
+        Struct(s) => {
+            let mut fields = Vec::new();
+            for field in s {
+                let field = field?;
+                let field_name = field.name()?.text().unwrap_or("").to_string();
+                let field_type = collect_signatures(field.value(), registry, min_size)?;
+                fields.push((field_name, field_type));
+            }
+            fields.sort_by(|a, b| a.0.cmp(&b.0));
+            let container_sig = ContainerSignature::Struct(fields);
+            if container_sig.size(registry) >= min_size {
+                let id = registry.get_or_create_id(container_sig);
+                TypeSignature::Container(id)
+            } else {
+                TypeSignature::Verbatim(container_sig)
+            }
+        }
+        List(l) => {
+            let mut elements = Vec::new();
+            for element in l {
+                let element_type = collect_signatures(element?, registry, min_size)?;
+                elements.push(element_type);
+            }
+            let container_sig = ContainerSignature::List(elements);
+            if container_sig.size(registry) >= min_size {
+                let id = registry.get_or_create_id(container_sig);
+                TypeSignature::Container(id)
+            } else {
+                TypeSignature::Verbatim(container_sig)
+            }
+        }
+        SExp(s) => {
+            let mut elements = Vec::new();
+            for element in s {
+                let element_type = collect_signatures(element?, registry, min_size)?;
+                elements.push(element_type);
+            }
+            let container_sig = ContainerSignature::SExp(elements);
+            if container_sig.size(registry) >= min_size {
+                let id = registry.get_or_create_id(container_sig);
+                TypeSignature::Container(id)
+            } else {
+                TypeSignature::Verbatim(container_sig)
+            }
+        }
+    })
+}

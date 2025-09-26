@@ -23,6 +23,7 @@ pub mod inspect;
 pub mod jq;
 pub mod primitive;
 pub mod schema;
+pub mod signatures;
 pub mod stats;
 pub mod symtab;
 pub mod to;

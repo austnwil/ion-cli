@@ -18,6 +18,7 @@ use crate::commands::inspect::InspectCommand;
 use crate::commands::jq::JqCommand;
 use crate::commands::primitive::PrimitiveCommand;
 use crate::commands::schema::SchemaNamespace;
+use crate::commands::signatures::SignaturesCommand;
 use crate::commands::stats::StatsCommand;
 use crate::commands::symtab::SymtabNamespace;
 use crate::commands::to::ToNamespace;
@@ -69,6 +70,7 @@ impl IonCliNamespace for RootCommand {
             Box::new(JqCommand),
             Box::new(PrimitiveCommand),
             Box::new(SchemaNamespace),
+            Box::new(SignaturesCommand),
             Box::new(SymtabNamespace),
             Box::new(ToNamespace),
             Box::new(StatsCommand),

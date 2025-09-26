@@ -239,6 +239,37 @@ impl TypeSignature {
     }
 }
 
+fn collect_sequence_signatures<'a, I>(
+    elements_iter: I,
+    registry: &mut SignatureRegistry,
+    min_size: usize,
+    top_level: bool,
+    signature_constructor: impl FnOnce(Vec<TypeSignature>) -> ContainerSignature,
+) -> Result<TypeSignature>
+where
+    I: Iterator<Item = Result<LazyValue<'a, AnyEncoding>, IonError>>,
+{
+    let mut elements = Vec::new();
+    for element in elements_iter {
+        let element_type = collect_signatures(element?, registry, min_size, false)?;
+        elements.push(element_type);
+    }
+    let container_sig = signature_constructor(elements.clone());
+    if container_sig.size(registry) >= min_size {
+        let (existing, id) = registry.get_or_create_id(container_sig, top_level);
+        if !existing {
+            for typ in &elements {
+                if let TypeSignature::Container(child_id) = typ {
+                    registry.id_to_signature.get_mut(child_id).unwrap().parent_count += 1;
+                }
+            }
+        }
+        Ok(TypeSignature::Container(id))
+    } else {
+        Ok(TypeSignature::Verbatim(container_sig))
+    }
+}
+
 fn collect_signatures(value: LazyValue<AnyEncoding>, registry: &mut SignatureRegistry, min_size: usize, top_level: bool) -> Result<TypeSignature> {
     use ValueRef::*;
     Ok(match value.read()? {
@@ -276,47 +307,19 @@ fn collect_signatures(value: LazyValue<AnyEncoding>, registry: &mut SignatureReg
                 TypeSignature::Verbatim(container_sig)
             }
         }
-        List(l) => {
-            let mut elements = Vec::new();
-            for element in l {
-                let element_type = collect_signatures(element?, registry, min_size, false)?;
-                elements.push(element_type);
-            }
-            let container_sig = ContainerSignature::List(elements.clone());
-            if container_sig.size(registry) >= min_size {
-                let (existing, id) = registry.get_or_create_id(container_sig, top_level);
-                if ! existing {
-                    for typ in &elements {
-                        if let TypeSignature::Container(child_id) = typ {
-                            registry.id_to_signature.get_mut(child_id).unwrap().parent_count += 1;
-                        }
-                    }
-                }
-                TypeSignature::Container(id)
-            } else {
-                TypeSignature::Verbatim(container_sig)
-            }
-        }
-        SExp(s) => {
-            let mut elements = Vec::new();
-            for element in s {
-                let element_type = collect_signatures(element?, registry, min_size, false)?;
-                elements.push(element_type);
-            }
-            let container_sig = ContainerSignature::SExp(elements.clone());
-            if container_sig.size(registry) >= min_size {
-                let (existing, id) = registry.get_or_create_id(container_sig, top_level);
-                if ! existing {
-                    for typ in &elements {
-                        if let TypeSignature::Container(child_id) = typ {
-                            registry.id_to_signature.get_mut(child_id).unwrap().parent_count += 1;
-                        }
-                    }
-                }
-                TypeSignature::Container(id)
-            } else {
-                TypeSignature::Verbatim(container_sig)
-            }
-        }
+        List(l) => collect_sequence_signatures(
+            l.into_iter(),
+            registry,
+            min_size,
+            top_level,
+            ContainerSignature::List,
+        )?,
+        SExp(s) => collect_sequence_signatures(
+            s.into_iter(),
+            registry,
+            min_size,
+            top_level,
+            ContainerSignature::SExp,
+        )?,
     })
 }
